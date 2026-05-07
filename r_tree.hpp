@@ -9,15 +9,16 @@
 #include <queue>
 #include <stdexcept>
 #include <vector>
-#include "node.hpp"
 #include "rect.hpp"
 
 template<typename Coord, std::size_t N, typename T, std::size_t MAX>
 class RTree {
 public:
-    using NodeType = Node<Coord, N, T, MAX>;
-    using NodePtr = std::unique_ptr<NodeType>;
-    using BranchType = Branch<Coord, N, T, MAX>;
+    struct Node;
+    struct Branch;
+
+    using NodePtr = std::unique_ptr<Node>;
+    using VariantType = std::variant<T, NodePtr>;
 
     enum class Group : std::int8_t {
         Unassigned = -1,
@@ -25,8 +26,43 @@ public:
         B = 1
     };
 
+    struct Branch {
+        Rect<Coord, N> rect{};
+        VariantType data{};
+
+        [[nodiscard]] bool is_leaf() const {
+            return std::holds_alternative<T>(data);
+        }
+
+        [[nodiscard]] bool is_internal() const {
+            return std::holds_alternative<NodePtr>(data);
+        }
+
+        [[nodiscard]] T& value() {
+            return std::get<T>(data);
+        }
+
+        [[nodiscard]] const T& value() const {
+            return std::get<T>(data);
+        }
+
+        [[nodiscard]] NodePtr& child() {
+            return std::get<NodePtr>(data);
+        }
+
+        [[nodiscard]] const NodePtr& child() const {
+            return std::get<NodePtr>(data);
+        }
+    };
+
+    struct Node {
+        std::array<Branch, MAX> branches{};
+        std::size_t count{0};
+        std::size_t level{0};
+    };
+
     struct Partition {
-        std::array<BranchType, MAX + 1> buffer;
+        std::array<Branch, MAX + 1> buffer;
         std::array<Group, MAX + 1> group;
         std::size_t total = 0;
         std::size_t min_fill = MAX / 2;
@@ -36,48 +72,86 @@ public:
     };
 
     struct KNNEntry {
-        const BranchType* branch;
+        const Branch* branch;
         Coord distance;
     };
 
 private:
     NodePtr root;
 
-    Rect<Coord, N> node_cover(const NodeType& node) {
-        return node.compute_mbr();
+    Rect<Coord, N> node_cover(const Node* node) {
+        if (node->count == 0) {
+            throw std::runtime_error("Empty node has no MBR");
+        }
+        Rect result = node->branches[0].rect;
+        for (std::size_t i = 1; i < node->count; ++i) {
+            result = result.merge(node->branches[i].rect);
+        }
+        return result;
     }
 
-    bool add_branch(NodeType* node, BranchType&& branch, NodePtr& new_node) {
-        if (!node->is_full()) {
-            node->add_branch(std::move(branch));
+    void add_branch_no_split(Node* node, Branch&& branch) {
+        if (node->count == MAX) {
+            throw std::runtime_error("Node overflow");
+        }
+        node->branches[node->count++] = std::move(branch);
+    }
+
+    bool add_branch(Node* node, Branch&& branch, NodePtr& new_node) {
+        if (node->count < MAX) {
+            add_branch_no_split(node, std::move(branch));
             return false;
         }
         split_node(node, std::move(branch), new_node);
         return true;
     }
 
-    void split_node(NodeType* node, BranchType new_branch, NodePtr& out_new_node) {
+    void remove_at(Node* node, std::size_t idx) {
+        if (idx >= node->count) {
+            throw std::out_of_range("remove_at out of range");
+        }
+        node->branches[idx] = std::move(node->branches[node->count - 1]);
+        --node->count;
+    }
+
+    void search_recursive(const Node* node,
+                          const Rect<Coord, N>& rect,
+                          std::vector<T>& results) const {
+        for (std::size_t i = 0; i < node->count; ++i) {
+            const auto& branch = node->branches[i];
+            if (!branch.rect.intersects(rect)) {
+                continue;
+            }
+            if (branch.is_leaf()) {
+                results.push_back(branch.value());
+            } else {
+                search_recursive(branch.child().get(), rect, results);
+            }
+        }
+    }
+
+    void split_node(Node* node, Branch new_branch, NodePtr& out_new_node) {
         Partition partition;
 
-        for (std::size_t i = 0; i < node->size(); ++i) {
-            partition.buffer[i] = std::move(node->at(i));
+        for (std::size_t i = 0; i < node->count; ++i) {
+            partition.buffer[i] = std::move(node->branches.at(i));
         }
-        partition.buffer[node->size()] = std::move(new_branch);
-        partition.total = node->size() + 1;
+        partition.buffer[node->count] = std::move(new_branch);
+        partition.total = node->count + 1;
         partition.group.fill(Group::Unassigned);
 
         pick_seeds(partition);
         choose_partition(partition);
 
-        out_new_node = std::make_unique<NodeType>();
-        out_new_node->set_level(node->get_level());
-        node->clear();
+        out_new_node = std::make_unique<Node>();
+        out_new_node->level = node->level;
+        node->count = 0;
 
         for (std::size_t i = 0; i < partition.total; ++i) {
             if (partition.group[i] == Group::A) {
-                node->add_branch(std::move(partition.buffer[i]));
+                add_branch_no_split(node, std::move(partition.buffer[i]));
             } else {
-                out_new_node->add_branch(std::move(partition.buffer[i]));
+                add_branch_no_split(out_new_node.get(), std::move(partition.buffer[i]));
             }
         }
     }
@@ -89,10 +163,9 @@ private:
 
         for (std::size_t i = 0; i < partition.total - 1; ++i) {
             for (std::size_t j = i + 1; j < partition.total; ++j) {
-                const auto combined =
-                    partition.buffer[i].get_rect().merge(partition.buffer[j].get_rect());
-                const Coord waste = combined.volume() - partition.buffer[i].get_rect().volume() -
-                                    partition.buffer[j].get_rect().volume();
+                const auto combined = partition.buffer[i].rect.merge(partition.buffer[j].rect);
+                const Coord waste = combined.volume() - partition.buffer[i].rect.volume() -
+                                    partition.buffer[j].rect.volume();
 
                 if (waste > worst) {
                     worst = waste;
@@ -111,8 +184,8 @@ private:
         auto group_idx = static_cast<std::size_t>(group);
         partition.cover[group_idx] =
             (partition.count[group_idx] == 0)
-                ? partition.buffer[idx].get_rect()
-                : partition.cover[group_idx].merge(partition.buffer[idx].get_rect());
+                ? partition.buffer[idx].rect
+                : partition.cover[group_idx].merge(partition.buffer[idx].rect);
 
         partition.area[group_idx] = partition.cover[group_idx].volume();
         partition.count[group_idx]++;
@@ -137,7 +210,7 @@ private:
                     continue;
                 }
 
-                const auto& rect = partition.buffer[i].get_rect();
+                const auto& rect = partition.buffer[i].rect;
 
                 auto merged0 = partition.cover[0].merge(rect);
                 auto merged1 = partition.cover[1].merge(rect);
@@ -174,60 +247,88 @@ private:
         }
     }
 
-    bool insert_recursive(NodeType* node,
-                          BranchType&& branch,
+    std::size_t choose_subtree(const Node* node, const Rect<Coord, N>& rect) const {
+        if (node->level == 0) {
+            throw std::runtime_error("choose_subtree called on leaf node");
+        }
+
+        if (node->count == 0) {
+            throw std::runtime_error("Internal node has no branches");
+        }
+
+        std::size_t best_index = 0;
+        Coord best_enlargement = std::numeric_limits<Coord>::max();
+        Coord best_volume = std::numeric_limits<Coord>::max();
+
+        for (std::size_t i = 0; i < node->count; ++i) {
+            const Rect<Coord, N>& current_rect = node->branches[i].rect;
+            const Coord current_volume = current_rect.volume();
+            const Coord current_enlargement = current_rect.merge(rect).volume() - current_volume;
+
+            if (current_enlargement < best_enlargement ||
+                (current_enlargement == best_enlargement && current_volume < best_volume)) {
+                best_index = i;
+                best_enlargement = current_enlargement;
+                best_volume = current_volume;
+            }
+        }
+        return best_index;
+    }
+
+    bool insert_recursive(Node* node,
+                          Branch&& branch,
                           NodePtr& new_node,
                           std::size_t target_level) {
-        if (node->get_level() > target_level) {
-            std::size_t idx = node->choose_subtree(branch.get_rect());
-            auto* child = node->at(idx).child().get();
+        if (node->level > target_level) {
+            std::size_t idx = choose_subtree(node, branch.rect);
+            auto* child = node->branches.at(idx).child().get();
 
             NodePtr split_node_ptr;
-            Rect original_rect = branch.get_rect();
+            Rect original_rect = branch.rect;
             bool child_split =
                 insert_recursive(child, std::move(branch), split_node_ptr, target_level);
 
             if (!child_split) {
-                node->at(idx).set_rect(node->at(idx).get_rect().merge(original_rect));
+                node->branches.at(idx).rect = node->branches.at(idx).rect.merge(original_rect);
                 return false;
             }
 
-            node->at(idx).set_rect(node_cover(*child));
+            node->branches.at(idx).rect = node_cover(child);
 
-            auto new_branch_cover = node_cover(*split_node_ptr);
-            BranchType new_branch{new_branch_cover, std::move(split_node_ptr)};
+            auto new_branch_cover = node_cover(split_node_ptr.get());
+            Branch new_branch{new_branch_cover, std::move(split_node_ptr)};
 
             return add_branch(node, std::move(new_branch), new_node);
         }
 
-        if (node->get_level() == target_level) {
+        if (node->level == target_level) {
             return add_branch(node, std::move(branch), new_node);
         }
 
         throw std::runtime_error("Invalid tree level in insert");
     }
 
-    void reinsert(NodePtr node, std::vector<NodePtr>& list) {
+    void reinsert(NodePtr&& node, std::vector<NodePtr>& list) {
         list.push_back(std::move(node));
     }
 
     bool remove_recursive(const Rect<Coord, N>* rect,
                           const T& value,
-                          NodeType* node,
+                          Node* node,
                           std::vector<NodePtr>& reinsert_list) {
-        if (!node->is_leaf()) {
-            for (std::size_t i = 0; i < node->size(); ++i) {
-                auto& branch = node->at(i);
+        if (node->level > 0) {
+            for (std::size_t i = 0; i < node->count; ++i) {
+                auto& branch = node->branches.at(i);
 
-                if ((rect == nullptr) || branch.get_rect().intersects(*rect)) {
+                if ((rect == nullptr) || branch.rect.intersects(*rect)) {
                     if (!remove_recursive(rect, value, branch.child().get(), reinsert_list)) {
                         auto& child_ptr = branch.child();
 
-                        if (child_ptr->size() >= MAX / 2) {
-                            branch.set_rect(node_cover(*child_ptr));
+                        if (child_ptr->count >= MAX / 2) {
+                            branch.rect = node_cover(child_ptr.get());
                         } else {
                             reinsert(std::move(child_ptr), reinsert_list);
-                            node->remove_at(i);
+                            remove_at(node, i);
                         }
                         return false;
                     }
@@ -235,11 +336,11 @@ private:
             }
             return true;
         }
-        for (std::size_t i = 0; i < node->size(); ++i) {
-            auto& branch = node->at(i);
+        for (std::size_t i = 0; i < node->count; ++i) {
+            auto& branch = node->branches.at(i);
 
             if (branch.is_leaf() && branch.value() == value) {
-                node->remove_at(i);
+                remove_at(node, i);
                 return false;
             }
         }
@@ -257,15 +358,15 @@ private:
 
         if (!not_found) {
             for (auto& node : reinsert_list) {
-                for (std::size_t i = 0; i < node->size(); ++i) {
+                for (std::size_t i = 0; i < node->count; ++i) {
                     NodePtr new_node;
-                    insert_recursive(root.get(), std::move(node->at(i)), new_node,
-                                     node->get_level());
+                    insert_recursive(root.get(), std::move(node->branches.at(i)), new_node,
+                                     node->level);
                 }
             }
 
-            if (root->size() == 1 && !root->is_leaf()) {
-                root = std::move(root->at(0).child());
+            if (root->count == 1 && root->level != 0) {
+                root = std::move(root->branches.at(0).child());
             }
 
             return true;
@@ -288,9 +389,9 @@ private:
         auto cmp = [](const KNNEntry& a, const KNNEntry& b) { return a.distance > b.distance; };
         std::priority_queue<KNNEntry, std::vector<KNNEntry>, decltype(cmp)> pq(cmp);
 
-        for (std::size_t i = 0; i < root->size(); ++i) {
-            const auto& branch = root->at(i);
-            Coord dist = rect_distance_sq(query, branch.get_rect());
+        for (std::size_t i = 0; i < root->count; ++i) {
+            const auto& branch = root->branches.at(i);
+            Coord dist = rect_distance_sq(query, branch.rect);
             pq.push(KNNEntry{&branch, dist});
         }
 
@@ -298,14 +399,14 @@ private:
             auto current = pq.top();
             pq.pop();
 
-            const BranchType* branch = current.branch;
+            const Branch* branch = current.branch;
 
             if (branch->is_internal()) {
                 const auto* node = branch->child().get();
 
-                for (std::size_t i = 0; i < node->size(); ++i) {
-                    const auto& child_branch = node->at(i);
-                    Coord dist = rect_distance_sq(query, child_branch.get_rect());
+                for (std::size_t i = 0; i < node->count; ++i) {
+                    const auto& child_branch = node->branches.at(i);
+                    Coord dist = rect_distance_sq(query, child_branch.rect);
 
                     pq.push(KNNEntry{&child_branch, dist});
                 }
@@ -323,31 +424,31 @@ public:
     std::vector<T> search(const Rect<Coord, N>& rect) const {
         std::vector<T> results;
         if (root) {
-            root->search(rect, results);
+            search_recursive(root.get(), rect, results);
         }
         return results;
     }
 
     void insert(const Rect<Coord, N>& rect, T value) {
         if (!root) {
-            root = std::make_unique<NodeType>();
-            root->set_level(0);
+            root = std::make_unique<Node>();
+            root->level = 0;
         }
 
-        BranchType branch{rect, std::move(value)};
+        Branch branch{rect, std::move(value)};
         NodePtr new_node;
 
         bool root_split = insert_recursive(root.get(), std::move(branch), new_node, 0);
 
         if (root_split) {
-            auto new_root = std::make_unique<NodeType>();
-            new_root->set_level(root->get_level() + 1);
+            auto new_root = std::make_unique<Node>();
+            new_root->level = root->level + 1;
 
-            auto old_cover = node_cover(*root.get());
-            new_root->add_branch(BranchType{old_cover, std::move(root)});
+            auto old_cover = node_cover(root.get());
+            add_branch_no_split(new_root.get(), Branch{old_cover, std::move(root)});
 
-            auto new_cover = node_cover(*new_node.get());
-            new_root->add_branch(BranchType{new_cover, std::move(new_node)});
+            auto new_cover = node_cover(new_node.get());
+            add_branch_no_split(new_root.get(), Branch{new_cover, std::move(new_node)});
 
             root = std::move(new_root);
         }
